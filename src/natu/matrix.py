@@ -20,7 +20,8 @@ from rdkit.Chem.rdchem import Mol
 
 from natu.variants import is_equivalent, parse_smiles
 from natu.constants import SubstitutionMatrix, StructureData
-from natu.variants import Modification, Variant, get_structure_variants, Chirality, NMethylation
+from natu.variants import (Modification, Variant, get_structure_variants, Chirality, NMethylation,
+                           ReductionState)
 
 
 logger = logging.getLogger(__name__)
@@ -100,10 +101,10 @@ def add_wildcard(df: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
 
     return df
 
-def load_tailoring_scores(scoring_config: dict[str, Any], modification: Modification) -> defaultdict[Chirality, dict[Chirality, float]] | defaultdict[NMethylation, dict[NMethylation, float]]:
+def load_tailoring_scores(scoring_config: dict[str, Any], modification: Modification) -> defaultdict[Chirality, dict[Chirality, float]] | defaultdict[NMethylation, dict[NMethylation, float]] | defaultdict[ReductionState, dict[ReductionState, float]]:
     """Return tailoring-aware score bonuses and penalties
 
-    :param scoring_config: scoring configuration for chirality or N-methylation
+    :param scoring_config: scoring configuration for chirality, N-methylation or reduction state
     :param modification: modification for tailoring scores
     :return: dictionary mapping tailoring modification (mis)matches to bit score bonuses/penalties
     """
@@ -123,6 +124,14 @@ def load_tailoring_scores(scoring_config: dict[str, Any], modification: Modifica
             nmethylation_scores[NMethylation[name_2.upper()]][NMethylation[name_1.upper()]] = score
         return nmethylation_scores
 
+    elif modification == Modification.reduction:
+        reduction_scores: defaultdict[ReductionState, dict[ReductionState, float]] = defaultdict(dict)
+        for score_name, score in scoring_config.items():
+            name_1, name_2 = score_name.split("_")
+            reduction_scores[ReductionState[name_1.upper()]][ReductionState[name_2.upper()]] = score
+            reduction_scores[ReductionState[name_2.upper()]][ReductionState[name_1.upper()]] = score
+        return reduction_scores
+
     else:
         raise ValueError(f"Unknown modification {modification}")
 
@@ -138,13 +147,18 @@ def expand_substitution_matrix(df: pd.DataFrame, tailoring_config: dict[str, Any
     """
     chirality_config = tailoring_config.get("chirality", {})
     n_methylation_config = tailoring_config.get("n_methylation", {})
+    # Optional third axis. Absent from every shipped configuration, so a config that
+    # does not define it behaves exactly as before.
+    reduction_config = tailoring_config.get("reduction", {})
+    reduction_aware = bool(reduction_config.get("reduction_aware_scoring"))
 
     if not chirality_config or not n_methylation_config:
         logger.warning("WARNING: Tailoring configuration is not set up correctly or completely. Tailoring-aware scoring is disabled.")
         return df
 
     if smiles_file is None:
-        if n_methylation_config["n_methylation_aware_scoring"] or chirality_config["chirality_aware_scoring"]:
+        if (n_methylation_config["n_methylation_aware_scoring"]
+                or chirality_config["chirality_aware_scoring"] or reduction_aware):
             logger.warning("WARNING: No SMILES file provided; cannot expand substitution matrix for tailoring-aware scoring")
         return df
 
@@ -153,6 +167,10 @@ def expand_substitution_matrix(df: pd.DataFrame, tailoring_config: dict[str, Any
 
     n_methylation_scores: defaultdict[NMethylation, dict[NMethylation, float]] = load_tailoring_scores(
         n_methylation_config["scoring"], Modification.n_methylation)
+
+    reduction_scores: defaultdict[ReductionState, dict[ReductionState, float]] = defaultdict(dict)
+    if reduction_aware:
+        reduction_scores = load_tailoring_scores(reduction_config["scoring"], Modification.reduction)
 
     base_alphabet: list[str] = list(df.columns)
     base_alphabet_set = set(base_alphabet)
@@ -203,7 +221,11 @@ def expand_substitution_matrix(df: pd.DataFrame, tailoring_config: dict[str, Any
             if n_methylation_config["n_methylation_aware_scoring"]:
                 methylation_score = n_methylation_scores[row_variant.n_methylation][col_variant.n_methylation]
 
-            scores[i, j] = base_score + chirality_score + methylation_score
+            reduction_score = 0.0
+            if reduction_aware:
+                reduction_score = reduction_scores[row_variant.reduction][col_variant.reduction]
+
+            scores[i, j] = base_score + chirality_score + methylation_score + reduction_score
 
     return pd.DataFrame(scores, index=all_names, columns=all_names)
 

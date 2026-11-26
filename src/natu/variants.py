@@ -25,6 +25,18 @@ N_AMINO_ACID = GroupDefiner("Nitrogen atom amino acid", "NCC(=O)O", 0)
 B_N_AMINO_ACID = GroupDefiner("Nitrogen atom beta amino acid", "NCCC(=O)O", 0) # Example: branched aspartic acid
 G_N_AMINO_ACID = GroupDefiner("Nitrogen atom beta amino acid", "NCCCC(=O)O", 0) # Example: branched glutamic acid
 
+# Reduction state of the beta-carbon of a polyketide extension unit.
+# The alphabet may be written with a free acid or a thioester at C1, so each state
+# has both forms. Index 1 is the beta-carbon in every pattern.
+BETA_KETO_ACID = GroupDefiner("beta-keto polyketide unit", "CC(=O)CC(=O)O", 1)
+BETA_KETO_THIOESTER = GroupDefiner("beta-keto polyketide unit, thioester", "CC(=O)CC(=O)SC", 1)
+BETA_HYDROXY_ACID = GroupDefiner("beta-hydroxy polyketide unit", "CC(O)CC(=O)O", 1)
+BETA_HYDROXY_THIOESTER = GroupDefiner("beta-hydroxy polyketide unit, thioester", "CC(O)CC(=O)SC", 1)
+BETA_ENE_ACID = GroupDefiner("alpha,beta-unsaturated polyketide unit", "CC=CC(=O)O", 1)
+BETA_ENE_THIOESTER = GroupDefiner("alpha,beta-unsaturated polyketide unit, thioester", "CC=CC(=O)SC", 1)
+BETA_RED_ACID = GroupDefiner("fully reduced polyketide unit", "CCCC(=O)O", 1)
+BETA_RED_THIOESTER = GroupDefiner("fully reduced polyketide unit, thioester", "CCCC(=O)SC", 1)
+
 logger = logging.getLogger(__name__)
 
 class Modification(Enum):
@@ -33,6 +45,7 @@ class Modification(Enum):
     """
     chirality = 1
     n_methylation = 2
+    reduction = 3
 
 
 class Chirality(Enum):
@@ -53,6 +66,23 @@ class NMethylation(Enum):
     X = 3
 
 
+class ReductionState(Enum):
+    """
+    Enum for storing the reduction state of the beta-carbon of a polyketide unit
+
+    KETO -> OH -> ENE -> RED is the order in which KR, DH and ER act, so the
+    distance between two states is the number of enzymatic steps between them.
+    X is for anything that is not a polyketide extension unit, including every
+    amino acid: scoring pairs involving X are 0 in every shipped configuration,
+    so NRPS matrices are unaffected.
+    """
+    KETO = 1
+    OH = 2
+    ENE = 3
+    RED = 4
+    X = 5
+
+
 @dataclass
 class Variant:
     """
@@ -65,6 +95,7 @@ class Variant:
     chirality: Chirality
     n_methylation: NMethylation
     modifications: list[Modification]
+    reduction: ReductionState = ReductionState.X
 
 
 #Taken from RAIChU
@@ -184,6 +215,41 @@ def get_nme_structure(structure: Structure) -> Structure | None:
     else:
         logger.debug("More than one methylation site found")
         return None
+
+
+def get_reduction_state(structure: Structure) -> ReductionState:
+    """Return the reduction state of the beta-carbon of a polyketide extension unit
+
+    This CLASSIFIES; it does not generate. Unlike the D- and N-methylated forms, the
+    four reduction states already exist as separate entries in the SMILES table, so
+    all this has to do is label each one.
+
+    Patterns are tried most specific first. A saturated C-C-C-C(=O)X chain is a
+    subgraph of all the other states, so RED has to be tested last or it would
+    swallow them.
+
+    Amino acids are rejected up front: a chain such as norvaline contains the same
+    saturated carbon skeleton and would otherwise be labelled RED, which would change
+    the score of NRPS pairs. Note that this guard does NOT cover Norine's fatty-acid
+    and hydroxy-acid starter units - octanoic acid and friends will be classified.
+    That is harmless while this axis is used for a PKS-only alphabet, but review the
+    labels before enabling it on an alphabet that mixes in those monomers.
+
+    :param structure: PIKAChU Structure object
+    :return: reduction state, or ReductionState.X if this is not a polyketide unit
+    """
+    if find_atoms(N_AMINO_ACID, structure) or find_atoms(B_N_AMINO_ACID, structure):
+        return ReductionState.X
+
+    for state, patterns in ((ReductionState.KETO, (BETA_KETO_ACID, BETA_KETO_THIOESTER)),
+                            (ReductionState.OH, (BETA_HYDROXY_ACID, BETA_HYDROXY_THIOESTER)),
+                            (ReductionState.ENE, (BETA_ENE_ACID, BETA_ENE_THIOESTER)),
+                            (ReductionState.RED, (BETA_RED_ACID, BETA_RED_THIOESTER))):
+        for pattern in patterns:
+            if find_atoms(pattern, structure):
+                return state
+
+    return ReductionState.X
 
 
 def is_equivalent(structure_1: Structure, structure_2: Structure) -> bool:
@@ -346,6 +412,10 @@ def compute_variants(name: str, smiles: str, tailoring_config: dict[str, Any]) -
     chirality_exclusions = chirality_config["exclude"]
     n_methylation_exclusions = n_methylation_config["exclude"]
 
+    # Optional: absent from every shipped configuration, so this is a no-op there.
+    reduction_config = tailoring_config.get("reduction", {})
+    reduction_exclusions = reduction_config.get("exclude", [])
+
     structure = read_smiles(smiles)
     d_structure = None
     nme_structure = None
@@ -357,12 +427,17 @@ def compute_variants(name: str, smiles: str, tailoring_config: dict[str, Any]) -
     if n_methylation_config["n_methylation_aware_scoring"]:
         nme_structure = get_nme_structure(structure)
 
+    reduction_state = ReductionState.X
+    if reduction_config.get("reduction_aware_scoring") and modify(name, reduction_exclusions):
+        reduction_state = get_reduction_state(structure)
+
     base = Variant(name=name,
                    smiles=smiles,
                    structure=structure,
                    base=None,
                    chirality=Chirality.X,
-                   n_methylation=NMethylation.X, modifications=[])
+                   n_methylation=NMethylation.X, modifications=[],
+                   reduction=reduction_state)
 
     variants = []
 
@@ -379,7 +454,8 @@ def compute_variants(name: str, smiles: str, tailoring_config: dict[str, Any]) -
                           base=base,
                           chirality=Chirality.X,
                           n_methylation=NMethylation.Y,
-                          modifications=[Modification.n_methylation]
+                          modifications=[Modification.n_methylation],
+                          reduction=base.reduction
                           )
         variants.append(variant)
 
@@ -395,7 +471,8 @@ def compute_variants(name: str, smiles: str, tailoring_config: dict[str, Any]) -
                           base=base,
                           chirality=Chirality.D,
                           n_methylation=base.n_methylation,
-                          modifications=[Modification.chirality])
+                          modifications=[Modification.chirality],
+                          reduction=base.reduction)
 
         variants.append(variant)
         if nme_structure is not None:
@@ -411,7 +488,8 @@ def compute_variants(name: str, smiles: str, tailoring_config: dict[str, Any]) -
                           base=base,
                           chirality=Chirality.D,
                           n_methylation=NMethylation.Y,
-                          modifications=[Modification.chirality, Modification.n_methylation])
+                          modifications=[Modification.chirality, Modification.n_methylation],
+                          reduction=base.reduction)
         variants.append(variant)
 
     structure_collection = StructureCollection(base, variants)
